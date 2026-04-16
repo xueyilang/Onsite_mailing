@@ -276,8 +276,11 @@ class FeishuClient:
         self.table_id = get_env("FEISHU_TABLE_ID", required=True)
         self.view_id = get_env("FEISHU_VIEW_ID")
         self.page_size = get_env("FEISHU_PAGE_SIZE", "100")
+        self._tenant_access_token: str | None = None
 
     def acquire_token(self) -> str:
+        if self._tenant_access_token:
+            return self._tenant_access_token
         payload = post_json(
             f"{self.base_url}/open-apis/auth/v3/tenant_access_token/internal",
             {"app_id": self.app_id, "app_secret": self.app_secret},
@@ -285,7 +288,8 @@ class FeishuClient:
         )
         if payload.get("code") != 0:
             raise RuntimeError(f"Feishu auth failed: {payload}")
-        return payload["tenant_access_token"]
+        self._tenant_access_token = payload["tenant_access_token"]
+        return self._tenant_access_token
 
     def list_records(self) -> List[Dict[str, Any]]:
         token = self.acquire_token()
@@ -311,6 +315,43 @@ class FeishuClient:
             if not data.get("has_more"):
                 return records
             page_token = data.get("page_token", "")
+
+    def download_attachment_bytes(self, file_token: str, direct_url: str = "", tmp_url: str = "") -> bytes:
+        token = self.acquire_token()
+        candidate_urls = []
+        if direct_url:
+            candidate_urls.append(direct_url)
+        if tmp_url:
+            candidate_urls.append(tmp_url)
+        if file_token:
+            candidate_urls.append(f"{self.base_url}/open-apis/drive/v1/medias/{file_token}/download")
+
+        last_error = None
+        for url in candidate_urls:
+            req = Request(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                method="GET",
+            )
+            try:
+                with urlopen(req, timeout=60) as response:
+                    content_type = response.headers.get("Content-Type", "")
+                    body = response.read()
+                    if "application/json" in content_type:
+                        try:
+                            payload = json.loads(body.decode("utf-8", errors="replace"))
+                            if payload.get("code") not in (None, 0):
+                                last_error = f"{url} => {payload}"
+                                continue
+                        except Exception:
+                            pass
+                    return body
+            except HTTPError as exc:
+                payload_text = exc.read().decode("utf-8", errors="replace")
+                last_error = f"{url} => HTTP {exc.code}: {payload_text}"
+            except URLError as exc:
+                last_error = f"{url} => Network error: {exc}"
+        raise RuntimeError(f"Feishu attachment download failed: {last_error}")
 
 
 class GraphMailer:
@@ -368,6 +409,7 @@ class GraphMailer:
         to_addresses: List[str],
         cc_addresses: List[str],
         attachment_paths: List[str],
+        in_memory_attachments: List[Dict[str, Any]] | None = None,
     ) -> None:
         attachments = []
         for attachment_path in attachment_paths:
@@ -381,6 +423,8 @@ class GraphMailer:
                     "contentBytes": content_bytes,
                 }
             )
+        for attachment in in_memory_attachments or []:
+            attachments.append(attachment)
         payload = {
             "message": {
                 "subject": subject,
@@ -412,16 +456,33 @@ class GraphMailer:
         return response
 
 
-def collect_people(records: List[Dict[str, Any]]) -> str:
-    people: List[str] = []
+def collect_people(records: List[Dict[str, Any]]) -> Tuple[str, str]:
+    zh_people: List[str] = []
+    en_people: List[str] = []
     for record in records:
-        raw_person = format_field_value("人员", record.get("人员")).strip()
+        raw_people = record.get("人员")
+        if isinstance(raw_people, list):
+            for item in raw_people:
+                if not isinstance(item, dict):
+                    continue
+                zh_name = str(item.get("name") or "").strip()
+                en_name = str(item.get("en_name") or "").strip()
+                if zh_name and zh_name not in zh_people:
+                    zh_people.append(zh_name)
+                preferred_en_name = en_name or zh_name
+                if preferred_en_name and preferred_en_name not in en_people:
+                    en_people.append(preferred_en_name)
+            continue
+
+        raw_person = format_field_value("人员", raw_people).strip()
         if not raw_person:
             continue
         for person in [part.strip() for part in raw_person.replace("，", ",").split(",") if part.strip()]:
-            if person not in people:
-                people.append(person)
-    return ", ".join(people)
+            if person not in zh_people:
+                zh_people.append(person)
+            if person not in en_people:
+                en_people.append(person)
+    return ", ".join(zh_people), ", ".join(en_people)
 
 
 def infer_year(records: List[Dict[str, Any]]) -> int:
@@ -508,12 +569,12 @@ def build_subject(year: int, kw: str) -> str:
     return f"{year} {kw}欧洲技术外勤及售后备品使用情况 {kw} Onsite Service"
 
 
-def build_body(year: int, kw: str, people_text: str, table_html: str) -> str:
+def build_body(year: int, kw: str, people_text_zh: str, people_text_en: str, table_html: str) -> str:
     return (
         "<p style='font-family:Segoe UI,Arial,sans-serif;font-size:12px;'>"
         "Dear All,<br><br>"
-        f"下表是{year} {kw}欧洲技术外勤及售后备品使用情况，由 {html.escape(people_text)} 执行：<br>"
-        f"the onsite Service in {year} {kw} was carried out by {html.escape(people_text)}, "
+        f"下表是{year} {kw}欧洲技术外勤及售后备品使用情况，由 {html.escape(people_text_zh)} 执行：<br>"
+        f"the onsite Service in {year} {kw} was carried out by {html.escape(people_text_en)}, "
         "the details are following:"
         "</p>"
         + table_html
@@ -562,6 +623,46 @@ def build_signature_html(profile: Dict[str, Any]) -> str:
         "Any unauthorized copying, disclosure or distribution of the material in this e-mail is strictly forbidden."
         "</p>"
     )
+
+
+def collect_feishu_attachment_descriptors(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    attachments: List[Dict[str, Any]] = []
+    seen_tokens: set[str] = set()
+    for record in records:
+        value = record.get("附件")
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            file_token = str(
+                item.get("file_token")
+                or item.get("token")
+                or item.get("fileToken")
+                or item.get("fileTokenForDownload")
+                or ""
+            ).strip()
+            name = str(
+                item.get("name")
+                or item.get("file_name")
+                or item.get("filename")
+                or item.get("title")
+                or ""
+            ).strip()
+            if not file_token or file_token in seen_tokens:
+                continue
+            seen_tokens.add(file_token)
+            attachments.append(
+                {
+                    "file_token": file_token,
+                    "name": name or f"{file_token}.bin",
+                    "content_type": str(item.get("type") or item.get("mime_type") or "application/octet-stream"),
+                    "url": str(item.get("url") or "").strip(),
+                    "tmp_url": str(item.get("tmp_url") or "").strip(),
+                    "raw": item,
+                }
+            )
+    return attachments
 
 
 class App:
@@ -800,7 +901,8 @@ class App:
         try:
             records = FeishuClient().list_records()
             filtered_records = [record for record in records if record_matches(record, kw, direction)]
-            people = collect_people(filtered_records) or "无"
+            people_zh, people_en = collect_people(filtered_records)
+            people = people_zh or people_en or "无"
             preview_lines = [
                 f"周数: {kw}",
                 f"方向: {direction}",
@@ -853,10 +955,18 @@ class App:
             return
 
         year = infer_year(self.filtered_records)
-        people_text = collect_people(self.filtered_records) or "N/A"
+        people_text_zh, people_text_en = collect_people(self.filtered_records)
+        people_text_zh = people_text_zh or people_text_en or "N/A"
+        people_text_en = people_text_en or people_text_zh or "N/A"
         rows = [project_record(record, include_onsite_details) for record in self.filtered_records]
         subject = self.subject_var.get().strip() or build_subject(year, kw)
-        body = build_body(year, kw, people_text, build_html_table(rows, include_onsite_details))
+        body = build_body(
+            year,
+            kw,
+            people_text_zh,
+            people_text_en,
+            build_html_table(rows, include_onsite_details),
+        )
 
         threading.Thread(
             target=self._send_email_worker,
@@ -875,6 +985,7 @@ class App:
         try:
             self.run_on_ui(self.set_status, "正在申请 Microsoft 365 登录...")
             mailer = GraphMailer()
+            feishu_client = FeishuClient()
             access_token = mailer.acquire_token(
                 lambda text: self.run_on_ui(self.set_status, text),
                 lambda code, url: self.run_on_ui(self.show_device_code, code, url),
@@ -882,8 +993,40 @@ class App:
             self.run_on_ui(self.close_device_code)
             profile = mailer.get_user_profile(access_token)
             full_body = body + build_signature_html(profile)
+            feishu_attachment_payloads = []
+            feishu_attachments = collect_feishu_attachment_descriptors(self.filtered_records)
+            if feishu_attachments:
+                self.run_on_ui(self.set_status, f"正在下载飞书附件 ({len(feishu_attachments)})...")
+                for item in feishu_attachments:
+                    try:
+                        content = feishu_client.download_attachment_bytes(
+                            item["file_token"],
+                            item.get("url", ""),
+                            item.get("tmp_url", ""),
+                        )
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"Feishu attachment download failed for {item['name']}: {exc}\n"
+                            f"Attachment raw data: {json.dumps(item.get('raw', {}), ensure_ascii=False)}"
+                        ) from exc
+                    feishu_attachment_payloads.append(
+                        {
+                            "@odata.type": "#microsoft.graph.fileAttachment",
+                            "name": item["name"],
+                            "contentType": item["content_type"],
+                            "contentBytes": base64.b64encode(content).decode("utf-8"),
+                        }
+                    )
             self.run_on_ui(self.set_status, "正在发送邮件...")
-            mailer.send_mail(access_token, subject, full_body, to_addresses, cc_addresses, attachment_paths)
+            mailer.send_mail(
+                access_token,
+                subject,
+                full_body,
+                to_addresses,
+                cc_addresses,
+                attachment_paths,
+                feishu_attachment_payloads,
+            )
             self.run_on_ui(self.set_status, "邮件发送成功。")
             self.run_on_ui(messagebox.showinfo, "完成", f"邮件已发送。\n收件人: {', '.join(to_addresses)}")
         except Exception as exc:
