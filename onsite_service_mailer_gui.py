@@ -456,6 +456,19 @@ class GraphMailer:
         return response
 
 
+def infer_english_given_name_from_email(email: str) -> str:
+    email = (email or "").strip().lower()
+    if "@" not in email:
+        return ""
+    local_part = email.split("@", 1)[0].strip()
+    if not local_part:
+        return ""
+    first_part = local_part.split(".", 1)[0].split("_", 1)[0].split("-", 1)[0].strip()
+    if not first_part:
+        return ""
+    return first_part[:1].upper() + first_part[1:]
+
+
 def collect_people(records: List[Dict[str, Any]]) -> Tuple[str, str]:
     zh_people: List[str] = []
     en_people: List[str] = []
@@ -466,10 +479,11 @@ def collect_people(records: List[Dict[str, Any]]) -> Tuple[str, str]:
                 if not isinstance(item, dict):
                     continue
                 zh_name = str(item.get("name") or "").strip()
+                email = str(item.get("email") or "").strip()
                 en_name = str(item.get("en_name") or "").strip()
                 if zh_name and zh_name not in zh_people:
                     zh_people.append(zh_name)
-                preferred_en_name = en_name or zh_name
+                preferred_en_name = infer_english_given_name_from_email(email) or en_name or zh_name
                 if preferred_en_name and preferred_en_name not in en_people:
                     en_people.append(preferred_en_name)
             continue
